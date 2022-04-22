@@ -1,0 +1,14 @@
+#!/bin/bash
+
+# Zu Systemsprache passende Sprachdatei einbinden (Default = Englisch)
+if [[ "${LANGDIR}" != "" ]]; then
+    DIR="${LANGDIR}"
+else
+    DIR="${ROOTDIR}/include/lang"
+fi
+
+if [[ -f "${DIR}/${LANG%%.*}.lang" ]]; then
+  source "${DIR}/${LANG%%.*}.lang"
+else
+  source "${DIR}/en_US.lang"
+fi

@@ -1,0 +1,695 @@
+#!/bin/bash
+
+#
+# Skript zur Synchronisation eines lokalen Verzeichnisses mit Onlineplattform per API
+#
+# Damit dieses Skript funktioniert, muss das Paket "jq" (zum Handling von JSON Input in Bash) installiert sein!
+#
+# Skriptaufruf: ./synchronise_media <Modulreiter-ID> <lokales Verzeichnis zum Synchronisieren> <Funktion> <Funktionsparameter>
+#
+
+################### Pfad setzen ###################
+
+pushd $(dirname "${0}") &> /dev/null
+ROOTDIR="$(pwd -P)"
+popd &> /dev/null
+
+################### Globale Variablen ###################
+
+MODUL_ID="${1}"
+WORKING_DIRECTORY="${2}" # lokales Verzeichnis, das online abgebildet werden soll
+ATTRIBUTE_DELIMITER="_" # Delimiter in Dateiname, um Attributwerte voneinander zu trennen
+SKIP_ATTRIBUTE="-" # Damit wird explizit angegeben, dass ein Attribut leer sein soll 
+ATTRIBUTE_LANGUAGES="en,de_DE" # Alle Sprachen, die derzeit unterstützt werden
+SCRIPT_NAME=$(basename "${0}")
+LANGUAGE_FILE="${ROOTDIR}/include/load_language"
+ERROR_LOG_FILE="${ROOTDIR}/../log/${SCRIPT_NAME}_error.log"
+LOCK_FILE="${ROOTDIR}/../run/${SCRIPT_NAME}_${MODUL_ID}.lock"
+API_CALL_FILE="${ROOTDIR}/include/API_calls"
+USER_ERROR_FILE="error.log"
+FOLDER_INFO_FILE=".folder_info"
+
+################### Sprachdatei einbinden ###################
+
+source "${LANGUAGE_FILE}"
+
+################### API Calls einbinden ###################
+
+source "${API_CALL_FILE}"
+
+################### Exklusiver Zugriff auf API je Modulreiter per Lock-Datei ###################
+
+# Semaphore, damit immer nur eine Instanz des Skripts einen Modulreiter synchronisieren kann
+exec 200>"${LOCK_FILE}"
+flock -n 200 || exit 1
+trap "rm -f ${LOCK_FILE}" EXIT
+
+################### Hilfsfunktionen ###################
+
+function error_log {
+	MESSAGE="${1}"
+	ERROR_TYPE="${2}"
+	
+	# Fehler, die Benutzer selbst beheben kann, in separate Logdatei
+	if [[ "${ERROR_TYPE}" = "USER_ERROR" ]]; then
+		if [[ "${WORKING_DIRECTORY}" != "" ]]; then
+			# Wenn Testmodul verwendet wird, Fehler auch auf Terminal ausgeben
+			if [[ "${MODUL_ID}" = 20 ]]; then
+				echo "$(date "+%d-%m-%Y %H:%M:%S"): ${TXT_CB_ERROR} ${MODUL_ID} >>> ${MESSAGE}" | tee -a "${WORKING_DIRECTORY}/${USER_ERROR_FILE}"
+			else
+				echo "$(date "+%d-%m-%Y %H:%M:%S"): ${TXT_CB_ERROR} ${MODUL_ID} >>> ${MESSAGE}" >> "${WORKING_DIRECTORY}/${USER_ERROR_FILE}"
+			fi
+		else
+			echo "$(date "+%d-%m-%Y %H:%M:%S"): ${TXT_CB_ERROR} ${MODUL_ID} >>> ${MESSAGE}"
+		fi
+	# Implementierungsfehler loggen
+	elif [[ "${ERROR_TYPE}" = "IMPLEMENTATION_ERROR" ]]; then
+		# Wenn Testmodul verwendet wird, Fehler auch auf Terminal ausgeben
+		if [[ "${MODUL_ID}" = 20 ]]; then
+			echo "$(date "+%d-%m-%Y %H:%M:%S"): ${TXT_CB_ERROR} ${MODUL_ID} >>> ${MESSAGE}" | tee -a "${ERROR_LOG_FILE}"
+		else
+			echo "$(date "+%d-%m-%Y %H:%M:%S"): ${TXT_CB_ERROR} ${MODUL_ID} >>> ${MESSAGE}" >> "${ERROR_LOG_FILE}"
+		fi
+	fi
+}
+
+# Funktion zur Validierung eines Dateinamens, der nach Schema 'Attribut 1_Attribut 2 englisch_Attribut 2 deutsch_-_.xxxx' aufgebaut ist
+# Delimiter: '_'
+# Attribut soll keinen Wert bekommen: '-'
+# Defaultsprache ist Englisch, bei mehrsprachigen Attributen stehen weitere Sprachen dahinter
+function validate_generic_file_name {
+	FILE_NAME="${1}"
+	ATTRIBUTE_LIST="${2}"
+
+	# Wurde Dateiendung gesetzt?
+	FILE_EXTENSION="${FILE_NAME##*_.}"
+	if ! [[ ${#FILE_EXTENSION} -ge 1 && ${#FILE_EXTENSION} -le 4 ]]; then
+		error_log "$(echo "${TXT_CB_FILE_EXTENSION_INVALID}" | sed -e "s/#FILE/$(echo "${FILE_NAME}" | sed -e 's/[&/\]/\\&/g')/g" -e "s/#EXTENSION/$(echo "${FILE_EXTENSION}" | sed -e 's/[&/\]/\\&/g')/g")" "USER_ERROR"
+		return 1
+	fi
+
+	# Dateiname in Array splitten
+	IFS="${ATTRIBUTE_DELIMITER}" read -ra TOKENS <<< "${FILE_NAME%.*}"
+	for TOKEN in "${TOKENS[@]}"; do
+		# Token ist leer
+    	if [[ "${TOKEN}" = "" ]]; then
+			error_log "$(echo "${TXT_CB_ERROR_EMPTY_FIELD}" | sed -e "s/#FILE/$(echo "${FILE_NAME}" | sed -e 's/[&/\]/\\&/g')/g" -e "s/#DELIMITER/$(echo "${ATTRIBUTE_DELIMITER}" | sed -e 's/[&/\]/\\&/g')/g")" "USER_ERROR"
+			return 1
+		fi
+	done
+
+	# Stimmt Anzahl der Tokens mit Anzahl der Attribute in Merkmalliste überein?
+	TOKEN_COUNT="${#TOKENS[@]}"
+	TOKEN_INDEX=0
+	MULTILINGUAL_COUNT=$(echo "${ATTRIBUTE_LIST}" | jq -r "map(select(.Multilingual == true)) | length")
+	MONOLINGUAL_COUNT=$(echo "${ATTRIBUTE_LIST}" | jq -r "map(select(.Multilingual == false)) | length")
+	ATTRIBUTE_COUNT=$((MULTILINGUAL_COUNT * 2 + MONOLINGUAL_COUNT ))
+	if [[ "${TOKEN_COUNT}" != "${ATTRIBUTE_COUNT}" ]]; then
+		error_log "$(echo "${TXT_CB_WRONG_TOKEN_AMOUNT}" | sed -e "s/#FILE/$(echo "${FILE_NAME}" | sed -e 's/[&/\]/\\&/g')/g" -e "s/#TOKEN_COUNT/${TOKEN_COUNT}/g" -e "s/#ATTRIBUTE_COUNT/${ATTRIBUTE_COUNT}/g")" "USER_ERROR"
+		return 1
+	fi
+
+	# Für jedes Attribut
+	for ATTRIBUTE_ID in $(echo "${ATTRIBUTE_LIST}" | jq -r ".[].Id"); do
+		IS_MULTILINGUAL=$(echo "${ATTRIBUTE_LIST}" | jq -r ".[] | select(.Id == \"${ATTRIBUTE_ID}\") | .Multilingual")
+		IS_REQUIRED=$(echo "${ATTRIBUTE_LIST}" | jq -r ".[] | select(.Id == \"${ATTRIBUTE_ID}\") | if .Required == 1 then true else false end")
+		TYPE=$(echo "${ATTRIBUTE_LIST}" | jq -r ".[] | select(.Id == \"${ATTRIBUTE_ID}\") | .Type")
+		NAME=$(echo "${ATTRIBUTE_LIST}" | jq -r ".[] | select(.Id == \"${ATTRIBUTE_ID}\") | .Name")
+
+		for LANGUAGE in $(echo "${ATTRIBUTE_LANGUAGES}" | sed "s/,/ /g"); do
+			ATTRIBUTE_VALUE="${TOKENS[${TOKEN_INDEX}]}"
+			if [[ "${ATTRIBUTE_VALUE}" != "${SKIP_ATTRIBUTE}" ]]; then
+				# Check, ob Attributwert valides Datum
+				if [[ "${TYPE}" = "SYS_DATE" ]]; then
+					if ! [[ "${ATTRIBUTE_VALUE}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || ! date -d "${ATTRIBUTE_VALUE}" &> /dev/null; then
+						error_log "$(echo "${TXT_CB_INVALID_DATE}" | sed -e "s/#FILE/$(echo "${FILE_NAME}" | sed -e 's/[&/\]/\\&/g')/g" -e "s/#VALUE/$(echo "${ATTRIBUTE_VALUE}" | sed -e 's/[&/\]/\\&/g')/g")" "USER_ERROR"
+						return 1
+					fi
+				# Check, ob Wert numerisch ist
+				elif [[ "${TYPE}" = "SYS_SELECT" ]]; then
+					if ! [[ "${ATTRIBUTE_VALUE}" =~ ^[0-9]+$ ]]; then
+						error_log "$(echo "${TXT_CB_VALUE_MUST_BE_NUMBER}" | sed -e "s/#FILE/$(echo "${FILE_NAME}" | sed -e 's/[&/\]/\\&/g')/g" -e "s/#VALUE/$(echo "${ATTRIBUTE_VALUE}" | sed -e 's/[&/\]/\\&/g')/g")" "USER_ERROR"
+						return 1
+					fi
+				fi
+			else
+				# Pflichtfeld ist leer
+				if [[ "${IS_REQUIRED}" = "true" ]]; then
+					error_log "$(echo "${TXT_CB_REQUIRED_ATTRIBUTE_MISSING}" | sed -e "s/#FILE/$(echo "${FILE_NAME}" | sed -e 's/[&/\]/\\&/g')/g" -e "s/#ATTRIBUTE/$(echo "${NAME}" | sed -e 's/[&/\]/\\&/g')/g")" "USER_ERROR"
+					return 1
+				fi
+			fi
+			# Index für nächstes Attribut erhöhen
+			(( TOKEN_INDEX++ ))
+			# Bei einsprachigen Attributen nur einmal ausführen
+			if [[ "${IS_MULTILINGUAL}" = "false" ]]; then
+				break
+			fi
+		done
+	done
+
+	# Dateiname ist fehlerfrei
+	return 0
+}
+
+function validate_file {
+	FILE_NAME="${1}"
+	ATTRIBUTE_LIST="${2}"
+	FILE_LIST="${3}"
+	HASH="${4}"
+	MODE="${5}"
+
+	# Enthält unerlaubte Zeichen (ungültiger Dateiname macht beim Hochladen keine Probleme, erst beim Updaten)
+	if [[ "$1" =~ [\\\/\?\*\:\;\"\{\}\<\>]+ ]]; then 
+		error_log "$(echo "${TXT_CB_FILE_NAME_INVALID_CHARACTERS}" | sed -e "s/#FILE/$(echo "${FILE_NAME}" | sed -e 's/[&/\]/\\&/g')/g" -e "s/#CHARACTERS/$(echo "${BASH_REMATCH[0]}" | sed -e 's/[&/\]/\\&/g')/g")" "USER_ERROR"
+		return 1
+	fi
+
+	# Datei ist Duplikat einer bereits hochgeladenen Datei
+	if [[ "${MODE}" = "UPDATE" ]]; then
+		DELETE_ELEMENT=$(echo "${FILE_LIST}" | jq -r ".[] | select(.Hash == \"${HASH}\" or .Attributes.\"20\".${ATTRIBUTE_LANGUAGES%%,*} == \"${HASH}\") | .DeleteElement")
+		if [[ "${DELETE_ELEMENT}" = "false" ]]; then
+			ORIGINAL_FILE_NAME=$(echo "${FILE_LIST}" | jq -r ".[] | select(.Hash == \"${HASH}\" or .Attributes.\"20\".${ATTRIBUTE_LANGUAGES%%,*} == \"${HASH}\") | .OriginalName")
+			error_log "$(echo "${TXT_CB_DUPLICATE_FILE}" | sed -e "s/#FILE/$(echo "${FILE_NAME}" | sed -e 's/[&/\]/\\&/g')/g" -e "s/#ORIGINAL_FILE/$(echo "${ORIGINAL_FILE_NAME}" | sed -e 's/[&/\]/\\&/g')/g")" "USER_ERROR"
+			return 1
+		fi
+	fi
+
+	# Modulreiterspezifische Validierungsregeln
+	case "${MODUL_ID}" in
+		# Testmodulreiter
+		20)
+			validate_generic_file_name "${FILE_NAME}" "${ATTRIBUTE_LIST}"
+			if [[ "$?" != "0" ]]; then
+				return 1
+			fi
+			;;
+		# für andere Modulreiter liegen derzeit keine Validierungsregeln vor
+		*)
+			error_log "$(echo "${TXT_CB_NO_PARSING_RULES_FOR_MODULE}" | sed -e "s/#FILE/$(echo "${FILE_NAME}" | sed -e 's/[&/\]/\\&/g')/g" -e "s/#MODULE/$(echo "${MODUL_ID}" | sed -e 's/[&/\]/\\&/g')/g")" "IMPLEMENTATION_ERROR"
+			return 1
+			;;
+	esac
+
+	return 0
+}
+
+# Funktion zum Auslesen von Attributewerten aus einem Dateinamen, der nach Schema 'Attribut 1_ Attribut 2 englisch_Attribut 2 deutsch_-_.xxxx' aufgebaut ist
+function get_generic_attribute {
+	FILE_NAME="${1}"
+	INDEX="${2}"
+
+	# Dateiname in Array splitten
+	IFS="${ATTRIBUTE_DELIMITER}" read -ra TOKENS <<< "${FILE_NAME%.*}"
+	echo "${TOKENS[${INDEX}]}"
+}
+
+function get_local_attribute_value {
+	ATTRIBUTE_ID="${1}"
+	PARENT_DIRECTORY="${2}"
+	FILE_NAME="${3}"
+	HASH="${4}"
+	INDEX="${5}"
+
+	case "${MODUL_ID}" in
+		# Testmodul
+		20)
+			VALUE=$(get_generic_attribute "${FILE_NAME}" "${INDEX}")
+			;;
+	esac
+
+	# Rückgabe
+	echo "${VALUE}"
+}
+
+# Baut dynamisch ein JSON-Objekt für Dateiupload oder -update
+function get_attributes {
+	FILE_PATH="${1}"
+	FILE_NAME="${2}"
+	HASH="${3}"
+	MODE="${4}"
+	FILE="${5}"
+	ATTRIBUTE_LIST="${6}"
+
+	PARENT_DIRECTORY=$(basename "$(dirname "${FILE_PATH}")")
+	INDEX=0
+	ATTRIBUTE_VALUES="{}"
+	RETURN_ATTRIBUTE_VALUES=""
+
+	# Über online Attributliste iterieren
+	for ATTRIBUTE_ID in $(echo "${ATTRIBUTE_LIST}" | jq -r ".[].Id"); do
+		IS_MULTILINGUAL=$(echo "${ATTRIBUTE_LIST}" | jq -r ".[] | select(.Id == \"${ATTRIBUTE_ID}\") | .Multilingual")
+		IS_REQUIRED=$(echo "${ATTRIBUTE_LIST}" | jq -r ".[] | select(.Id == \"${ATTRIBUTE_ID}\") | if .Required == 1 then true else false end")
+		TYPE=$(echo "${ATTRIBUTE_LIST}" | jq -r ".[] | select(.Id == \"${ATTRIBUTE_ID}\") | .Type")
+		for LANGUAGE in $(echo "${ATTRIBUTE_LANGUAGES}" | sed "s/,/ /g"); do
+			# Lokalen Attributwert auslesen
+			LOCAL_ATTRIBUTE_VALUE=$(get_local_attribute_value "${ATTRIBUTE_ID}" "${PARENT_DIRECTORY}" "${FILE_NAME}" "${HASH}" "${INDEX}")
+			if [[ "${LOCAL_ATTRIBUTE_VALUE}" = "${SKIP_ATTRIBUTE}" ]]; then
+				LOCAL_ATTRIBUTE_VALUE=""
+			fi
+			
+			# online hinterlegten Attributwert abfragen
+			if [[ "${MODE}" = "UPDATE" ]]; then
+				ONLINE_ATTRIBUTE_VALUE=$(echo "${FILE}" | jq -r ".Attributes.\"${ATTRIBUTE_ID}\".${LANGUAGE}")
+				# Bei Datum nur ersten Wert
+				if [[ "${TYPE}" = "SYS_DATE" ]]; then
+					ONLINE_ATTRIBUTE_VALUE=$(echo "${ONLINE_ATTRIBUTE_VALUE}" | awk '{print $1}')
+				fi
+			fi
+
+			# Update auslösen?
+			if [[ "${MODE}" = "INITIALIZE" || "${LOCAL_ATTRIBUTE_VALUE}" != "${ONLINE_ATTRIBUTE_VALUE}" ]]; then
+				RETURN_ATTRIBUTE_VALUES="true"
+			fi
+			# Zu ATTRIBUTE_VALUES hinzufügen
+			if [[ "${MODE}" = "INITIALIZE" || "${IS_REQUIRED}" = "true" || "${LOCAL_ATTRIBUTE_VALUE}" != "${ONLINE_ATTRIBUTE_VALUE}" ]]; then
+				if [[ $(echo "${ATTRIBUTE_VALUES}" | jq -r "has(\"${ATTRIBUTE_ID}\")") = "true" ]]; then
+					# Nur Sprachwert hinzufügen
+					ATTRIBUTE_VALUES=$(echo "${ATTRIBUTE_VALUES}" | jq -r ".\"${ATTRIBUTE_ID}\" += {\"${LANGUAGE}\": \"${LOCAL_ATTRIBUTE_VALUE}\"}")
+				else
+					# Attribut ID und Sprachwert hinzufügen
+					ATTRIBUTE_VALUES=$(echo "${ATTRIBUTE_VALUES}" | jq -r ". += {\"${ATTRIBUTE_ID}\": {\"${LANGUAGE}\": \"${LOCAL_ATTRIBUTE_VALUE}\"}}")
+				fi
+			fi
+			# Index erhöhen für nächste Sprache/Attribut
+			(( INDEX++ ))
+			# Bei einsprachigen Attributen nur einmal ausführen
+			if [[ "${IS_MULTILINGUAL}" = "false" ]]; then
+				break
+			fi
+		done
+	done
+
+	# Dateiname ändern?
+	if [[ "${MODE}" = "UPDATE" ]]; then
+		ONLINE_FILE_NAME=$(echo "${FILE}" | jq -r ".OriginalName")
+		if [[ "${FILE_NAME}" != "${ONLINE_FILE_NAME}" ]]; then
+			RETURN_ATTRIBUTE_VALUES="true"
+			ATTRIBUTE_VALUES=$(echo "${ATTRIBUTE_VALUES}" | jq  ".+= {\"PSEUDO_FILENAME\": {\"en\": \"${FILE_NAME%.*}\"}}")
+		fi
+	fi
+
+	# Rückgabe
+	if [[ "${RETURN_ATTRIBUTE_VALUES}" = "true" ]]; then
+		echo "${ATTRIBUTE_VALUES}"
+	else
+		echo "{}"
+	fi
+}
+
+################### Funktionen zum Verarbeiten von API Calls ###################
+
+# Kategorieliste für Modulreiter anfragen und alle irrelevanten Informationen rausschneiden
+function initialize_category_list {
+	CATEGORY_LIST_RESPONSE=$(apicall_list_categories)
+	if [[ "$?" != "0" ]]; then
+		error_log "$(echo "${TXT_CB_REQUESTING_CATEGORY_LIST_FAILED}" | sed -e "s/#RESPONSE/$(echo "${CATEGORY_LIST_RESPONSE}" | sed -e 's/[&/\]/\\&/g')/g")" "IMPLEMENTATION_ERROR"
+		return 1
+	fi
+
+	# Nur Id, Parent Id, Name und Titel der Kategorie in Kategorieliste aufführen, Deleteflag setzen
+	CATEGORY_LIST_RESPONSE=$(echo "${CATEGORY_LIST_RESPONSE}" | jq -r ".response | map({Id: .Id, Parent: .Parent, Name: .Name, Title: .Title, DeleteElement: true})")
+	
+	# Rückgabe
+	echo "${CATEGORY_LIST_RESPONSE}"
+	return 0
+}
+
+# Dateiliste für Modulreiter anfragen und alle irrelevanten Informationen rausschneiden
+function initialize_file_list {
+	FILE_LIST_RESPONSE=""
+	for LANGUAGE in $(echo "${ATTRIBUTE_LANGUAGES}" | sed "s/,/ /g"); do
+		RESPONSE=$(apicall_list_files "&lg=${LANGUAGE}")
+		if [[ "$?" != "0" ]]; then
+			error_log "$(echo "${TXT_CB_REQUESTING_FILE_LIST_FAILED}" | sed -e "s/#LANGUAGE/$(echo "${LANGUAGE}" | sed -e 's/[&/\]/\\&/g')/g" -e "s/#RESPONSE/$(echo "${RESPONSE}" | sed -e 's/[&/\]/\\&/g')/g")" "IMPLEMENTATION_ERROR"
+			return 1
+		fi
+
+		# Nur Name, Id, md5-Hash, gekürzte Attributinformationen und Kategorieinformationen der Datei in Dateiliste aufführen, Deleteflag setzen
+		if [[ "${FILE_LIST_RESPONSE}" = "" ]]; then
+			FILE_LIST_RESPONSE=$(echo "${RESPONSE}" | jq -r ".response | map({OriginalName: .OriginalName, Id: .Id, Hash: .MetaAttributes.\"2\".Value, Attributes: .Attributes | del(.ClassType) | with_entries(.value = {\"${LANGUAGE}\": .value.Value}), temp: .Categories, DeleteElement: true}| if .temp != null then . += {Categories: .temp | with_entries(.value = .value.Value)} else . end | del(.temp))")
+		else
+			for FILE_ID in $(echo "${RESPONSE}" | jq -r ".response[].Id"); do
+				for ATTRIBUTE_ID in $(echo "${RESPONSE}" | jq -r ".response[] | select(.Id == \"${FILE_ID}\") | .Attributes | del(.ClassType) | keys[]"); do
+					ATTRIBUTE_VALUE=$(echo "${RESPONSE}" | jq -r ".response[] | select(.Id == \"${FILE_ID}\") | .Attributes.\"${ATTRIBUTE_ID}\".Value")
+					FILE_LIST_RESPONSE=$(echo "${FILE_LIST_RESPONSE}" | jq -r "map(if .Id == \"${FILE_ID}\" then .Attributes.\"${ATTRIBUTE_ID}\" += {\"${LANGUAGE}\": \"${ATTRIBUTE_VALUE}\"} else . end)")
+				done
+			done
+		fi
+	done
+
+	# Rückgabe
+	echo "${FILE_LIST_RESPONSE}"
+	return 0
+}
+
+# Attributliste für Modulreiter anfragen und alle irrelevanten Informationen rausschneiden
+function initialize_attribute_list {
+	ATTRIBUTE_LIST_RESPONSE=$(apicall_list_attributes)
+	if [[ "$?" != "0" ]]; then
+		error_log "$(echo "${TXT_CB_REQUESTING_ATTRIBUTE_LIST_FAILED}" | sed -e "s/#RESPONSE/$(echo "${ATTRIBUTE_LIST_RESPONSE}" | sed -e 's/[&/\]/\\&/g')/g")" "IMPLEMENTATION_ERROR"
+		return 1
+	fi
+	# Metaattribute aus Attributliste entfernen, nur Id, Typ, Mehrsprachigkeit-Flag und Pflichtattribut-Flag aufführen
+	ATTRIBUTE_LIST_RESPONSE=$(echo "${ATTRIBUTE_LIST_RESPONSE}" | jq -r ".response  | map(select(.Id | try tonumber) | {Id: .Id, Name: .Name, Type: .Type, Multilingual: .Multilingual, Required: .Required})")
+	
+	# Rückgabe
+	echo "${ATTRIBUTE_LIST_RESPONSE}"
+	return 0
+}
+
+function upload_file {
+	FILE_PATH="${1}"
+	FILE_NAME="${2}"
+	FILE_LIST="${3}"
+	HASH="${4}"
+	ATTRIBUTE_VALUES="${5}"
+
+	FILE_SIZE=$(wc -c "${FILE_PATH}" | awk '{print $1}')
+	RESPONSES=$(apicall_upload_file "${FILE_PATH}" "${FILE_NAME}" "${FILE_SIZE}" "${ATTRIBUTE_VALUES}")
+	if [[ "$?" = "0" ]]; then
+		# hochgeladene Datei in Dateiliste eintragen
+		FILE_INFO=$(echo "${RESPONSES}" | jq -r ".upload_2.response | {OriginalName: .OriginalName, Id: .Id, Hash: \"${HASH}\", Attributes: .Attributes | del(.ClassType) | with_entries(.value = {\"${ATTRIBUTE_LANGUAGES%%,*}\": .value.Value}), DeleteElement: false}")
+		FILE_LIST=$(echo "${FILE_LIST}" | jq --argjson file "${FILE_INFO}" ". += [\$file]")
+		return 0
+	else
+		UPLOAD_RESPONSE_CODE=$(echo "${RESPONSES}" | jq -r ".upload_2.code")
+		UPLOAD_RESPONSE_MESSAGE=$(echo "${RESPONSES}" | jq -r ".upload_2.message")
+		# Abfangen, wenn Datei im Papierkorb
+		if [[ "${UPLOAD_RESPONSE_CODE}" = "403" && "${UPLOAD_RESPONSE_MESSAGE}" = "Upload denied. The same file is already existing." ]]; then
+			error_log "$(echo "${TXT_CB_FILE_ALREADY_UPLOADED}" | sed -e "s/#FILE/$(echo "${FILE_NAME}" | sed -e 's/[&/\]/\\&/g')/g")" "USER_ERROR"
+			return 1
+		else
+			error_log "$(echo "${TXT_CB_UPLOADING_FILE_FAILED}" | sed -e "s/#FILE/$(echo "${FILE_NAME}" | sed -e 's/[&/\]/\\&/g')/g" -e "s/#RESPONSE/$(echo "${RESPONSES}" | sed -e 's/[&/\]/\\&/g')/g")" "IMPLEMENTATION_ERROR"
+			return 1
+		fi
+	fi
+}
+
+function update_file {
+	FILE_ID="${1}"
+	ATTRIBUTES="${2}"
+	FILE_NAME="${3}"
+
+	RESPONSE=$(apicall_update_file "${FILE_ID}" "${ATTRIBUTES}")
+	if [[ "$?" != "0" ]]; then
+		error_log "$(echo "${TXT_CB_UPDATING_FILE_FAILED}" | sed -e "s/#FILE/$(echo "${FILE_NAME}" | sed -e 's/[&/\]/\\&/g')/g" -e "s/#RESPONSE/$(echo "${RESPONSE}" | sed -e 's/[&/\]/\\&/g')/g")" "IMPLEMENTATION_ERROR"
+	else
+		# Dateiname in Dateiliste aktualisieren (eigentlich wäre es schön auch Attribute in Dateiliste nach Update zu aktualisieren, aber in RESPONSE werden nur englische Attributwerte ausgegeben...)
+		CURRENT_FILE_NAME=$(echo "${RESPONSE}" | jq -r ".response.OriginalName")
+		FILE_LIST=$(echo "${FILE_LIST}" | jq "map(if .Id == \"${FILE_ID}\" then .OriginalName = \"${CURRENT_FILE_NAME}\" else . end)")
+	fi
+}
+
+# Mitgegebene Dateien löschen
+function delete_files {
+	FILE_LIST="${1}"
+
+	for FILE_ID in $(echo "${FILE_LIST}" | jq -r ".[] | select(.DeleteElement == true) | .Id"); do
+		RESPONSE=$(apicall_delete_file "${FILE_ID}")
+		if [[ "$?" != "0" ]]; then
+			FILE_NAME=$(echo "${FILE_LIST}" | jq -r ".[] | select(.Id == \"${FILE_ID}\") | .OriginalName")
+			error_log "$(echo "${TXT_CB_DELETING_FILE_FAILED}" | sed -e "s/#FILE/$(echo "${FILE_NAME}" | sed -e 's/[&/\]/\\&/g')/g" -e "s/#RESPONSE/$(echo "${RESPONSE}" | sed -e 's/[&/\]/\\&/g')/g")" "IMPLEMENTATION_ERROR"
+		fi
+	done
+}
+
+# Datei einer Kategorie zuweisen bzw. Zuweisung(en) entfernen
+function assign_category {
+	ITEMS="${1}"
+    ROOT_CATEGORY_ID="${2}"
+    ACTION="${3}" 
+	CATEGORIES="${4}"
+
+	RESPONSE=$(apicall_assign_category "${ITEMS}" "${ROOT_CATEGORY_ID}" "${ACTION}" "${CATEGORIES}")
+	if [[ "$?" != "0" ]]; then
+		error_log "$(echo "${TXT_CB_CATEGORY_ASSIGNMENT_FAILED}" | sed -e "s/#RESPONSE/$(echo "${RESPONSE}" | sed -e 's/[&/\]/\\&/g')/g")" "IMPLEMENTATION_ERROR"
+	fi
+}
+
+function create_category {
+	CATEGORY_NAME="${1}"
+	PARENT_ID="${2}"
+	CATEGORY_PATH="${3}"
+
+	RESPONSE=$(apicall_create_category "${CATEGORY_NAME}" "${PARENT_ID}")
+	if [[ "$?" != "0" ]]; then
+		error_log "$(echo "${TXT_CB_CREATING_CATEGORY_FAILED}" | sed -e "s/#NAME/$(echo "${CATEGORY_NAME}" | sed -e 's/[&/\]/\\&/g')/g" -e "s/#RESPONSE/$(echo "${RESPONSE}" | sed -e 's/[&/\]/\\&/g')/g")" "IMPLEMENTATION_ERROR"
+	else
+		CATEGORY_ID=$(echo "${RESPONSE}" | jq -r ".response.Id")
+		# Versteckte Datei mit Category Id erstellen
+		echo "${CATEGORY_ID}" > "${CATEGORY_PATH}/${FOLDER_INFO_FILE}"
+	fi
+}
+
+function update_category {
+	CATEGORY_ID="${1}"
+	PARENT_ID="${2}"
+	CATEGORY_NAME="${3}"
+
+	RESPONSE=$(apicall_update_category "${CATEGORY_NAME}" "${CATEGORY_ID}" "${PARENT_ID}")
+	if [[ "$?" != "0" ]]; then
+		error_log "$(echo "${TXT_CB_UPDATING_CATEGORY_FAILED}" | sed -e "s/#NAME/$(echo "${CATEGORY_NAME}" | sed -e 's/[&/\]/\\&/g')/g" -e "s/#RESPONSE/$(echo "${RESPONSE}" | sed -e 's/[&/\]/\\&/g')/g")" "IMPLEMENTATION_ERROR"
+	fi
+}
+
+# Angegebene Kategorien löschen
+function delete_categories {
+	CATEGORY_LIST="${1}"
+
+	for CATEGORY_ID in $(echo "${CATEGORY_LIST}" | jq -r ".[] | select(.DeleteElement == true) | .Id"); do
+		# Nur Parentkategorien löschen (Kinder löschen sich automatisch mit)
+		PARENT_ID=$(echo "${CATEGORY_LIST}" | jq -r ".[] | select(.Id == \"${CATEGORY_ID}\") | .Parent")
+		if [[ $(echo "${CATEGORY_LIST}" | jq -r ".[] | select(.DeleteElement == true) | select(.Id == \"${PARENT_ID}\")") = "" ]]; then
+			RESPONSE=$(apicall_delete_category "${CATEGORY_ID}")
+			if [[ "$?" != "0" ]]; then
+				error_log "$(echo "${TXT_CB_DELETING_CATEGORY_FAILED}" | sed -e "s/#ID/$(echo "${CATEGORY_ID}" | sed -e 's/[&/\]/\\&/g')/g" -e "s/#RESPONSE/$(echo "${RESPONSE}" | sed -e 's/[&/\]/\\&/g')/g")" "IMPLEMENTATION_ERROR"
+			fi
+		fi
+	done
+}
+
+################### Synchronisierungs-Funktionen ###################
+
+function sync_category {
+	PARENT_ID="${1}"
+	CATEGORY_NAME="${2}"
+	CATEGORY_PATH="${3}"
+	CATEGORY_LIST="${4}"
+
+	# Kategorie existiert schon online
+	if [[ -a "${CATEGORY_PATH}/${FOLDER_INFO_FILE}" ]]; then
+		CATEGORY_ID=$(cat "${CATEGORY_PATH}/${FOLDER_INFO_FILE}")
+		LISTED_CATEGORY_NAME=$(echo "${CATEGORY_LIST}" | jq -r ".[] | select(.Id == \"${CATEGORY_ID}\") | .Name")
+		LISTED_PARENT_ID=$(echo "${CATEGORY_LIST}" | jq -r ".[] | select(.Id == \"${CATEGORY_ID}\") | .Parent")
+		
+		# Delete Flag entfernen
+		CATEGORY_LIST=$(echo "${CATEGORY_LIST}" | jq "map(if .Id == \"${CATEGORY_ID}\" then .DeleteElement = false else . end)")
+
+		# Wenn .folder_info nicht aktuell ist
+		if [[ "${LISTED_CATEGORY_NAME}" = "" && "${LISTED_PARENT_ID}" = "" ]]; then
+			error_log "$(echo "${TXT_CB_FOLDER_INFO_OUTDATED}" | sed -e "s/#PATH/$(echo "${CATEGORY_PATH}" | sed -e 's/[&/\]/\\&/g')/g" -e "s/#ID/$(echo "${CATEGORY_ID}" | sed -e 's/[&/\]/\\&/g')/g" -e "s/#FOLDER_INFO/$(echo "${FOLDER_INFO_FILE}" | sed -e 's/[&/\]/\\&/g')/g")" "IMPLEMENTATION_ERROR"
+		else
+			# Ist Kategorie noch, wo sie laut Liste sein sollte oder wurde sie lokal verschoben?
+			if [[ "${PARENT_ID}" != "${LISTED_PARENT_ID}" || "${CATEGORY_NAME}" != "${LISTED_CATEGORY_NAME}" ]]; then
+				update_category "${CATEGORY_ID}" "${PARENT_ID}" "${CATEGORY_NAME}"
+			fi
+		fi
+	# Wenn lokaler Kategorieordner noch keine ID hat, Kategorie online anlegen
+	else
+		create_category "${CATEGORY_NAME}" "${PARENT_ID}" "${CATEGORY_PATH}"
+	fi
+}
+
+function sync_file {
+	PARENT_ID="${1}"
+	FILE_NAME="${2}"
+	FILE_PATH="${3}"
+	FILE_LIST="${4}"
+	ATTRIBUTE_LIST="${5}"
+
+	# Datei hochladen? Nach Hash in Metaattribut md5-Hash der Files suchen und zusätzlich in Attribut md5-Hash wegen Duplikat-hochlade-Bug beim Rendern
+	HASH=$(md5sum "${FILE_PATH}" | awk '{print $1}')
+	# Backslash vor Hash entfernen, falls vorhanden
+	HASH=${HASH//\\}
+	IS_UPLOADED=$(echo "${FILE_LIST}" | jq -r "map(select(.Hash == \"${HASH}\" or .Attributes.\"20\".${ATTRIBUTE_LANGUAGES%%,*} == \"${HASH}\")) | any")
+	# Datei ist noch nicht hochgeladen
+	if [[ "${IS_UPLOADED}" = "false" ]]; then
+		validate_file "${FILE_NAME}" "${ATTRIBUTE_LIST}" "${FILE_LIST}" "${HASH}" "INITIALIZE"
+		# Nur hochladen, wenn der Dateiname korrekt ist, weil Upload fehlschlägt, wenn Pflichtattribute nicht gesetzt werden
+		if [[ "$?" = "0" ]]; then
+			ATTRIBUTE_VALUES=$(get_attributes "${FILE_PATH}" "${FILE_NAME}" "${HASH}" "INITIALIZE" "" "${ATTRIBUTE_LIST}")
+			upload_file "${FILE_PATH}" "${FILE_NAME}" "${FILE_LIST}" "${HASH}" "${ATTRIBUTE_VALUES}"
+			if [[ "$?" = "0" ]]; then
+				IS_UPLOADED="true"
+				FILE_ID=$(echo "${FILE_LIST}" | jq -r ".[] | select(.Hash == \"${HASH}\") | .Id")
+			fi
+		fi
+	# Datei ist bereits hochgeladen
+	elif [[ "${IS_UPLOADED}" = "true" ]]; then
+		FILE=$(echo "${FILE_LIST}" | jq -r ".[] | select(.Hash == \"${HASH}\" or .Attributes.\"20\".${ATTRIBUTE_LANGUAGES%%,*} == \"${HASH}\")")
+		FILE_ID=$(echo "${FILE}" | jq -r ".Id")
+		# Nur updaten, wenn der Dateiname korrekt ist, weil Attribute updaten fehlschlägt, wenn Pflichtattribute nicht gesetzt werden
+		validate_file "${FILE_NAME}" "${ATTRIBUTE_LIST}" "${FILE_LIST}" "${HASH}" "UPDATE"
+		if [[ "$?" = "0" ]]; then
+			ATTRIBUTE_VALUES=$(get_attributes "${FILE_PATH}" "${FILE_NAME}" "${HASH}" "UPDATE" "${FILE}" "${ATTRIBUTE_LIST}")
+			if [[ "${ATTRIBUTE_VALUES}" != "{}" ]]; then
+				update_file "${FILE_ID}" "${ATTRIBUTE_VALUES}" "${FILE_NAME}"
+			fi
+		fi
+		# Delete Flag für diese Datei entfernen
+		FILE_LIST=$(echo "${FILE_LIST}" | jq "map(if .Id == \"${FILE_ID}\" then .DeleteElement=false else . end)")
+	else
+		error_log "$(echo "${TXT_CB_FILE_NOT_FOUND_IN_LIST}" | sed -e "s/#VALUE/$(echo "${IS_UPLOADED}" | sed -e 's/[&/\]/\\&/g')/g" -e "s/#FILE/$(echo "${FILE_NAME}" | sed -e 's/[&/\]/\\&/g')/g")" "IMPLEMENTATION_ERROR" 
+	fi
+
+	# Kategoriezuweisungen für Datei nur, wenn Parent ID nicht Modul ID entspricht
+	if [[ "${IS_UPLOADED}" = "true" && "${FILE_ID}" != "" && "${PARENT_ID}" != "${MODUL_ID}" ]]; then
+		assign_category "${FILE_ID}" "${ROOT_CATEGORY_ID}" "1" "${PARENT_ID}"
+	fi
+}
+
+# Rootkategorie-Ordner rekursiv durchlaufen
+function walk_sub_directory {
+	CATEGORY_LIST="${3}"
+	FILE_LIST="${4}"
+	ROOT_CATEGORY_ID="${5}"
+	ATTRIBUTE_LIST="${6}"
+	
+	# Inhalt des Verzeichnisses durchlaufen
+	while read CONTENT; do
+		if [[ "${CONTENT}" = "READING_ERROR" ]]; then
+			error_log "$(echo "${TXT_CB_LISTING_DIRECTORY_CONTENT_FAILED}" | sed -e "s/#PATH/$(echo "${1}" | sed -e 's/[&/\]/\\&/g')/g")" "IMPLEMENTATION_ERROR"  
+			return 1
+		fi
+
+		PARENT_ID="${2}"
+		PARENT_DIRECTORY="${7}"
+		# Inhalt ist Kategorie
+		if [[ -d "${1}/${CONTENT}" ]]; then
+			if [[ "${PARENT_ID}" != "" ]]; then
+				sync_category "${PARENT_ID}" "${CONTENT}" "${1}/${CONTENT}" "${CATEGORY_LIST}"
+				if [[ -a "${1}/${CONTENT}/${FOLDER_INFO_FILE}" ]]; then
+					CATEGORY_ID=$(cat "${1}/${CONTENT}/${FOLDER_INFO_FILE}")
+					# Rekursiver Aufruf
+					walk_sub_directory "${1}/${CONTENT}" "${CATEGORY_ID}" "${CATEGORY_LIST}" "${FILE_LIST}" "${ROOT_CATEGORY_ID}" "${ATTRIBUTE_LIST}" "${PARENT_DIRECTORY}"
+				fi
+			else
+				error_log "$(echo "${TXT_CB_UNKNOWN_PARENT_ID}" | sed -e "s/#PATH/$(echo "${1}/${CONTENT}" | sed -e 's/[&/\]/\\&/g')/g")" "IMPLEMENTATION_ERROR"   
+				return 1
+			fi
+		# Inhalt ist Datei
+		else
+			sync_file "${PARENT_ID}" "${CONTENT}" "${1}/${CONTENT}" "${FILE_LIST}" "${ATTRIBUTE_LIST}"
+		fi
+	done < <(ls "${1}" 2> /dev/null; if [[ "$?" != "0" ]]; then echo "READING_ERROR"; fi )
+}
+
+# lokales Verzeichnis vollständig online abbilden: 
+# neue Kategorien erstellen, Bestehende updaten, Alte löschen, zuweisen
+# neue Dateien hochladen, Alte löschen, Bestehende updaten
+function full_synchronisation {
+	DELETE_FLAG="${1}"
+
+	# Kategorie-, Datei- und Attributliste für Modul anfragen
+	CATEGORY_LIST=$(initialize_category_list)
+	CATEGORY_LIST_CODE="$?"
+	FILE_LIST=$(initialize_file_list)
+	FILE_LIST_CODE="$?"
+	ATTRIBUTE_LIST=$(initialize_attribute_list)
+	ATTRIBUTE_LIST_CODE="$?"
+
+	if [[ "${ATTRIBUTE_LIST_CODE}" != "0" || "${FILE_LIST_CODE}" != "0" || "${CATEGORY_LIST_CODE}" != "0" ]]; then
+		exit 1
+	fi
+
+	while read CONTENT; do
+		if [[ "${CONTENT}" = "READING_ERROR" ]]; then
+			error_log "$(echo "${TXT_CB_LISTING_DIRECTORY_CONTENT_FAILED}" | sed -e "s/#PATH/$(echo "${WORKING_DIRECTORY}" | sed -e 's/[&/\]/\\&/g')/g")" "IMPLEMENTATION_ERROR"  
+			exit 1
+		fi
+
+		# Über Unterordner rekursiv iterieren
+		if [[ -d "${WORKING_DIRECTORY}/${CONTENT}" ]]; then
+			ROOT_CATEGORY_ID=$(cat "${WORKING_DIRECTORY}/${CONTENT}/${FOLDER_INFO_FILE}")
+
+			# Kategoriezuweisungen für Synchronisation auflösen
+			FILE_IDS=$(echo "${FILE_LIST}" | jq -r "map(if has(\"Categories\") then select(.Categories.\"${ROOT_CATEGORY_ID}\" != \"\") | .Id | tonumber else empty end) | @csv")
+			# Assignments nur von Files, die Assignment(s) in dieser Rootkategorie haben, auflösen
+			if [[ "${FILE_IDS}" != "" ]]; then
+				assign_category "${FILE_IDS}" "${ROOT_CATEGORY_ID}" "3"
+			fi
+
+			# Subkategorien durchlaufen
+			walk_sub_directory "${WORKING_DIRECTORY}/${CONTENT}" "${ROOT_CATEGORY_ID}" "${CATEGORY_LIST}" "${FILE_LIST}" "${ROOT_CATEGORY_ID}" "${ATTRIBUTE_LIST}" "${CONTENT}"
+			RET=$?
+		# Dateien ohne Kategorie
+		else
+			if [[ "${CONTENT}" != "${USER_ERROR_FILE}" ]]; then
+				sync_file "${MODUL_ID}" "${CONTENT}" "${WORKING_DIRECTORY}/${CONTENT}" "${FILE_LIST}" "${ATTRIBUTE_LIST}"
+			fi
+		fi
+	done < <(ls "${WORKING_DIRECTORY}" 2> /dev/null; if [[ "$?" != "0" ]]; then echo "READING_ERROR"; fi )
+
+	# Alle Dateien/Kategorien aus Modulreiter online löschen, die in lokalem Verzeichnis nicht vorhanden sind
+	if [[ "${RET}" = "0" && "${DELETE_FLAG}" = "WITH_DELETE" ]]; then
+		delete_categories "${CATEGORY_LIST}"
+		delete_files "${FILE_LIST}"
+	fi
+}
+
+# Nur Dateien hochladen, die lokal neu dazu gekommen sind
+function synchronise_only_files {
+	DELETE_FLAG="${1}"
+
+	# Dateiliste und Attributliste anfragen
+	FILE_LIST=$(initialize_file_list)
+	FILE_LIST_CODE="$?"
+	ATTRIBUTE_LIST=$(initialize_attribute_list)
+	ATTRIBUTE_LIST_CODE="$?"
+
+	if [[ "${ATTRIBUTE_LIST_CODE}" != "0" || "${FILE_LIST_CODE}" != "0" ]]; then
+		exit 1
+	fi
+
+	# Dateien synchronisieren
+	while read -r FILE; do
+		if [[ "${FILE}" = "READING_ERROR" ]]; then 
+			error_log "$(echo "${TXT_CB_LISTING_DIRECTORY_CONTENT_FAILED}" | sed -e "s/#PATH/$(echo "${WORKING_DIRECTORY}" | sed -e 's/[&/\]/\\&/g')/g")" "IMPLEMENTATION_ERROR"  
+			exit 1
+		fi
+
+		if [[ "${FILE}" != "" ]]; then 
+			sync_file "${MODUL_ID}" "$(basename "${FILE}")" "${FILE}" "${FILE_LIST}" "${ATTRIBUTE_LIST}"
+		fi
+	done <<< "$(find "${WORKING_DIRECTORY}" -type f -not -path '*/\.*' -not -path "*/${USER_ERROR_FILE}" 2> /dev/null; if [[ "$?" != "0" ]]; then echo "READING_ERROR"; fi)"
+
+	if [[ "${DELETE_FLAG}" = "WITH_DELETE" ]]; then
+		delete_files "${FILE_LIST}"
+	fi
+}
+
+# Onlinestruktur an mitgegebenes lokales Verzeichnis anpassen
+function local_to_online {
+	MODE="${1}"
+	DELETE_FLAG="${2}"
+	
+	# Was synchronisieren?
+	case "${MODE}" in
+		ONLY_FILES)
+			synchronise_only_files "${DELETE_FLAG}"
+			;;
+		FULL_SYNC) # lokales Verzeichnis vollständig online abbilden
+			full_synchronisation "${DELETE_FLAG}"
+			;;
+		*)
+			error_log "$(echo "${TXT_CB_UNKNOWN_MODE}" | sed -e "s/#MODE/$(echo "${MODE}" | sed -e 's/[&/\]/\\&/g')/g")" "IMPLEMENTATION_ERROR"   
+			return 1
+			;;
+	esac
+}
+
+################### Funktionsaufruf ###################
+
+shift 2
+"${@}"
